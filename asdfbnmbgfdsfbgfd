@@ -1,0 +1,441 @@
+import sys
+import math
+import random
+import numpy as np
+import pyqtgraph as pg
+import pyqtgraph.opengl as gl
+
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QLabel
+)
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QImage, QPixmap
+
+
+# ---------------- PURE PYTHON PERLIN NOISE (no external library) ----------------
+
+class Perlin:
+    def __init__(self, seed=None):
+        if seed is None:
+            seed = random.randint(0, 1_000_000)
+        random.seed(seed)
+
+        self.p = list(range(256))
+        random.shuffle(self.p)
+        self.p = self.p * 2
+
+    def fade(self, t):
+        # 6t^5 - 15t^4 + 10t^3
+        return t * t * t * (t * (t * 6 - 15) + 10)
+
+    def lerp(self, a, b, t):
+        return a + t * (b - a)
+
+    def grad(self, hash, x, y):
+        h = hash & 3
+        u = x if h < 2 else y
+        v = y if h < 2 else x
+        return (u if (h & 1) == 0 else -u) + (v if (h & 2) == 0 else -v)
+
+    def noise2(self, x, y):
+        X = int(math.floor(x)) & 255
+        Y = int(math.floor(y)) & 255
+
+        x -= math.floor(x)
+        y -= math.floor(y)
+
+        u = self.fade(x)
+        v = self.fade(y)
+
+        A = self.p[X] + Y
+        B = self.p[X + 1] + Y
+
+        return self.lerp(
+            self.lerp(self.grad(self.p[A], x, y),
+                      self.grad(self.p[B], x - 1, y),
+                      u),
+            self.lerp(self.grad(self.p[A + 1], x, y - 1),
+                      self.grad(self.p[B + 1], x - 1, y - 1),
+                      u),
+            v,
+        )
+
+
+def fractal_noise(perlin: Perlin, x, y, octaves=4, persistence=0.5, lacunarity=2.0):
+    """Fractal Brownian motion using Perlin.noise2."""
+    value = 0.0
+    amplitude = 1.0
+    frequency = 1.0
+    for _ in range(octaves):
+        value += amplitude * perlin.noise2(x * frequency, y * frequency)
+        amplitude *= persistence
+        frequency *= lacunarity
+    return value
+
+
+# ------------- TERRAIN COLOR MAP -----------------
+
+def terrain_color(h: float):
+    """
+    Map normalized height h in [0,1] to RGBA terrain color.
+    Same logic used for nodes, edges, and legend.
+    """
+    if h < 0.2:
+        return (0.0, 0.0, 0.5, 1.0)      # deep water
+    if h < 0.35:
+        return (0.0, 0.5, 0.8, 1.0)      # shallow water
+    if h < 0.45:
+        return (0.9, 0.8, 0.5, 1.0)      # sand
+    if h < 0.65:
+        return (0.1, 0.7, 0.1, 1.0)      # grass
+    if h < 0.85:
+        return (0.5, 0.4, 0.3, 1.0)      # rock
+    return (1.0, 1.0, 1.0, 1.0)          # snow
+
+
+# ------------- MAIN WIDGET -----------------
+
+class TerrainWindow(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # --- Parameters ---
+        self.N = 50000
+        self.E = 1   # you can increase edges if you want
+        self.xy_extent = 200
+
+        # --- Layout ---
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(4, 4, 4, 4)
+        main_layout.setSpacing(6)
+
+        # Left side: 3D view + legend
+        left_layout = QVBoxLayout()
+        left_layout.setSpacing(4)
+
+        # 3D view
+        self.view3d = gl.GLViewWidget()
+        self.view3d.setWindowTitle("Large 3D Terrain Graph")
+        self.view3d.setCameraPosition(distance=220)
+        self.view3d.opts['azimuth'] = 45
+        self.view3d.opts['elevation'] = 30
+        self.view3d.setBackgroundColor((15, 15, 20))  # dark background
+
+        left_layout.addWidget(self.view3d, stretch=1)
+
+        # Height legend under the 3D view
+        legend_layout = QHBoxLayout()
+        legend_layout.setContentsMargins(0, 0, 0, 0)
+        legend_layout.setSpacing(8)
+
+        legend_layout.addWidget(QLabel("High"), alignment=Qt.AlignmentFlag.AlignTop)
+
+        self.legend_label = QLabel()
+        self.legend_label.setFixedWidth(32)
+        self.legend_label.setFixedHeight(200)
+        self.legend_label.setFrameShape(QLabel.Shape.Panel)
+        self.legend_label.setFrameShadow(QLabel.Shadow.Sunken)
+        legend_layout.addWidget(self.legend_label)
+
+        legend_layout.addWidget(QLabel("Low"), alignment=Qt.AlignmentFlag.AlignBottom)
+
+        left_layout.addLayout(legend_layout)
+
+        main_layout.addLayout(left_layout, stretch=3)
+
+        # Right side: minimap
+        right_layout = QVBoxLayout()
+        right_layout.setSpacing(4)
+
+        self.minimap = pg.PlotWidget()
+        self.minimap.setTitle("Top-down minimap (X-Y)")
+        self.minimap.setAspectLocked(True)
+        self.minimap.showGrid(x=True, y=True, alpha=0.3)
+        self.minimap.getPlotItem().setMenuEnabled(False)
+        self.minimap.getPlotItem().hideButtons()
+        self.minimap.setLabel('left', 'Y')
+        self.minimap.setLabel('bottom', 'X')
+
+        # Update 3D rectangle when minimap view moves/zooms
+        self.minimap.getViewBox().sigRangeChanged.connect(
+            lambda *args: self.update_3d_focus_rectangle()
+        )
+
+        right_layout.addWidget(self.minimap)
+        main_layout.addLayout(right_layout, stretch=2)
+
+        # Generate terrain + graph and draw
+        self.generate_terrain_and_graph()
+        self.build_legend_image()
+
+    # ------------- 3D FOCUS RECT FROM 2D RANGE -------------
+
+    def update_3d_focus_rectangle(self):
+        # Remove previous rectangle if it exists
+        if hasattr(self, "focus_rect_item"):
+            self.view3d.removeItem(self.focus_rect_item)
+
+        vb = self.minimap.getViewBox()
+        (xmin, xmax), (ymin, ymax) = vb.viewRange()
+
+        # Make a rectangle on Z=0 plane
+        rect_points = np.array([
+            [xmin, ymin, 0],
+            [xmax, ymin, 0],
+            [xmax, ymax, 0],
+            [xmin, ymax, 0],
+            [xmin, ymin, 0]
+        ], dtype=float)
+
+        rect_colors = np.array(
+            [(1, 1, 0, 1)] * len(rect_points),   # yellow
+            dtype=float
+        )
+
+        self.focus_rect_item = gl.GLLinePlotItem(
+            pos=rect_points,
+            color=rect_colors,
+            width=2,
+            mode='line_strip'
+        )
+
+        self.view3d.addItem(self.focus_rect_item)
+
+    # ------------- TERRAIN & GRAPH GENERATION -------------
+
+    def generate_terrain_and_graph(self):
+        N = self.N
+        E = self.E
+        extent = self.xy_extent
+
+        # --- Generate X,Y uniformly ---
+        x = np.random.uniform(-extent, extent, N)
+        y = np.random.uniform(-extent, extent, N)
+
+        # --- Generate more realistic Z (height) with pure Python Perlin ---
+        perlin = Perlin(seed=42)
+        scale = 0.02    # controls "zoom"
+        amp = 60.0      # height amplitude
+
+        z = np.empty(N, dtype=float)
+        for i in range(N):
+            # fractal Perlin noise for nice terrain
+            z[i] = fractal_noise(
+                perlin,
+                x[i] * scale,
+                y[i] * scale,
+                octaves=4,
+                persistence=0.5,
+                lacunarity=2.0
+            ) * amp
+
+        nodes = np.vstack([x, y, z]).T
+
+        # --- Normalize height to [0,1] ---
+        z_norm = (z - z.min()) / (z.max() - z.min() + 1e-9)
+
+        # --- Node colors (terrain palette) ---
+        node_colors = np.zeros((N, 4), dtype=float)
+        for i, h in enumerate(z_norm):
+            node_colors[i] = terrain_color(h)
+
+        # --- 3D Scatter: make nodes more visible ---
+        scatter = gl.GLScatterPlotItem(
+            pos=nodes,
+            size=3,              # bigger points
+            color=node_colors,
+            pxMode=True          # size in pixels, not world units
+        )
+        self.view3d.addItem(scatter)
+
+        # --- Add 3D grid ---
+        grid = gl.GLGridItem()
+        grid.setSize(x=2 * extent, y=2 * extent, z=0)
+        grid.setSpacing(x=20, y=20, z=1)
+        self.view3d.addItem(grid)
+
+        # --- Height rings / contour-ish bands in 3D ---
+        ring_levels = [0.2, 0.4, 0.6, 0.8]  # in normalized height
+        eps = 0.01
+        ring_mask = np.zeros(N, dtype=bool)
+        for lvl in ring_levels:
+            ring_mask |= np.abs(z_norm - lvl) < eps
+
+        ring_points = nodes[ring_mask]
+        if ring_points.size > 0:
+            rings_scatter = gl.GLScatterPlotItem(
+                pos=ring_points,
+                size=3,
+                color=(1.0, 1.0, 1.0, 1.0),
+                pxMode=True
+            )
+            self.view3d.addItem(rings_scatter)
+
+        # --- Build edges (optional, currently E edges) ---
+        edges_idx = np.random.randint(0, N, size=(E, 2))
+
+        edges = np.zeros((E, 2, 3), dtype=np.float32)
+        edge_colors = np.zeros((E * 2, 4), dtype=float)
+
+        for i, (a, b) in enumerate(edges_idx):
+            edges[i, 0] = nodes[a]
+            edges[i, 1] = nodes[b]
+
+            ha = z_norm[a]
+            hb = z_norm[b]
+
+            ca = list(terrain_color(ha))
+            cb = list(terrain_color(hb))
+
+            # Make edges less dominant: lower alpha
+            ca[3] = 0.25
+            cb[3] = 0.25
+
+            edge_colors[i * 2] = ca
+            edge_colors[i * 2 + 1] = cb
+
+        edges_item = gl.GLLinePlotItem(
+            pos=edges.reshape(-1, 3),
+            color=edge_colors,
+            mode='lines',
+            width=1
+        )
+        self.view3d.addItem(edges_item)
+
+        # --- 2D minimap (top-down) ---
+        brushes = [
+            pg.mkBrush(
+                int(c[0] * 255),
+                int(c[1] * 255),
+                int(c[2] * 255),
+                int(c[3] * 255)
+            )
+            for c in node_colors
+        ]
+
+        mini_scatter = pg.ScatterPlotItem(
+            x=x,
+            y=y,
+            brush=brushes,
+            size=5,
+            pen=None
+        )
+        self.minimap.addItem(mini_scatter)
+
+        self.minimap.setXRange(-extent, extent)
+        self.minimap.setYRange(-extent, extent)
+
+        # Optionally also show rings in minimap (light overlay)
+        if ring_points.size > 0:
+            rx = ring_points[:, 0]
+            ry = ring_points[:, 1]
+            rings_2d = pg.ScatterPlotItem(
+                x=rx,
+                y=ry,
+                brush=pg.mkBrush(255, 255, 255, 120),
+                size=7,
+                pen=pg.mkPen(0, 0, 0, 150, width=1)
+            )
+            self.minimap.addItem(rings_2d)
+
+        # Store for potential future use (e.g. interaction)
+        self.nodes = nodes
+        self.z = z
+        self.z_norm = z_norm
+
+        # ---- FAKE SEARCH PATH (n random points) ----
+        n_path = 4  # number of path points
+
+        path_indices = np.random.choice(N, size=n_path, replace=False)
+        path_points = nodes[path_indices]  # shape (n, 3)
+
+        # Lift path slightly above terrain so it's always visible
+        path_points[:, 2] += 2.0
+
+        # build line segments for the path
+        path_edges = np.zeros((n_path - 1, 2, 3), dtype=float)
+        for i in range(n_path - 1):
+            path_edges[i, 0] = path_points[i]
+            path_edges[i, 1] = path_points[i + 1]
+
+        # flatten (PyQtGraph expects shape (k,3))
+        path_edges_flat = path_edges.reshape(-1, 3)
+
+        # red, bold path line
+        path_colors = np.zeros((len(path_edges_flat), 4), dtype=float)
+        path_colors[:] = (1.0, 0.0, 0.0, 1.0)  # solid red
+
+        path_item = gl.GLLinePlotItem(
+            pos=path_edges_flat,
+            color=path_colors,
+            width=4,         # thicker line
+            mode='lines'
+        )
+        self.view3d.addItem(path_item)
+
+        # ---- Also draw path on minimap ----
+        path_x = path_points[:, 0]
+        path_y = path_points[:, 1]
+
+        self.minimap.plot(
+            path_x,
+            path_y,
+            pen=pg.mkPen((255, 0, 0), width=3)
+        )
+
+        # draw initial focus rectangle (3D box for 2D view range)
+        self.update_3d_focus_rectangle()
+
+    # ------------- HEIGHT LEGEND IMAGE -------------
+
+    def build_legend_image(self):
+        """
+        Build a vertical gradient image using terrain_color(h)
+        and place it in self.legend_label.
+        """
+        h_res = 256
+        img = np.zeros((h_res, 1, 3), dtype=np.uint8)
+
+        for i in range(h_res):
+            h = 1.0 - i / (h_res - 1)  # top = high, bottom = low
+            r, g, b, _ = terrain_color(h)
+            img[i, 0, 0] = int(r * 255)
+            img[i, 0, 1] = int(g * 255)
+            img[i, 0, 2] = int(b * 255)
+
+        qimg = QImage(
+            img.data,
+            1,
+            h_res,
+            3,
+            QImage.Format.Format_RGB888
+        )
+
+        qimg = qimg.scaled(
+            self.legend_label.width(),
+            self.legend_label.height(),
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+        self.legend_label.setPixmap(QPixmap.fromImage(qimg))
+
+
+# ------------- MAIN -------------
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+
+    # Enable PyQtGraph antialiasing for nicer minimap
+    pg.setConfigOptions(antialias=True)
+
+    w = TerrainWindow()
+    w.setWindowTitle("Terrain Graph Visualizer")
+    w.resize(1400, 800)
+    w.show()
+
+    sys.exit(app.exec())
